@@ -1,0 +1,160 @@
+hwtest.py - hardware test utility for the QSXP-ML81 carrier
+============================================================
+
+Quick command-line checks for I2C, GPIO and SPI on the Ka-Ro QSXP-ML81
+(NXP i.MX8M Plus) custom carrier, run on the target from Python.
+
+
+REQUIREMENTS
+------------
+On target (all present in the current karo-image-minimal build):
+  python3
+  python3-gpiod   (libgpiod v2 bindings; v1 is rejected with a message)
+  python3-smbus2
+  python3-spidev
+
+Run as root (the karo-minimal default).
+
+
+INSTALL
+-------
+Rootfs is mounted read-only, so keep scripts on userfs:
+
+  scp -O hwtest.py root@<board-ip>:/mnt/userfs/
+
+-O forces the legacy scp protocol. OpenSSH on Ubuntu 24.04 defaults to
+SFTP, which dropbear does not provide.
+
+NOTE: a flash script that writes karo-image-userfs wipes /mnt/userfs.
+Copy the scripts back after such a flash.
+
+
+COMMANDS
+--------
+info
+    Python and module versions, I2C adapters, GPIO chips (with i.MX bank
+    numbers), /dev/spidev* nodes. Run this first.
+
+i2c-scan BUS
+    i2cdetect-style scan of addresses 0x03-0x77.
+      xx  device responded
+      --  no response
+      UU  address owned by a kernel driver (driver name listed below
+          the table); not probed
+    Probes with a 1-byte read.
+
+i2c-read BUS ADDR REG [COUNT] [-w 1|2]
+    Write register address, then read COUNT bytes (default 1), hexdump.
+    -w 2 for 16-bit register addresses (camera sensors, large EEPROMs).
+    Uses the I2C_RDWR ioctl, which works even on driver-owned addresses.
+    Reading a driver-owned device can race the driver; fine for debug.
+
+i2c-write BUS ADDR REG DATA... [-w 1|2] [--force]
+    Write register address followed by data bytes.
+    Refuses driver-owned addresses unless --force.
+
+gpio-list [--all]
+    Lines claimed by the kernel (or all lines with --all), with consumer,
+    direction and active-low flag.
+
+gpio-get LINE
+    Request LINE as input and print its value.
+    WARNING: if a free line is currently an output, this flips it to input.
+
+gpio-set LINE 0|1 [--hold SECONDS]
+    Drive LINE as an output. Holds until Enter, or for --hold seconds.
+    After release the i.MX usually keeps the last value (not guaranteed).
+
+gpio-toggle LINE [--hz HZ] [--count N]
+    Square wave for scope checks of pinmux/routing. Ctrl-C stops.
+
+spi-loop BUS CS [--speed HZ] [--mode 0-3] [--len N]
+    Loopback test. Requires a MOSI<->MISO jumper.
+    Reports PASS, or FAIL with first mismatch; flags a stuck MISO.
+
+spi-probe BUS CS [--speed HZ] [--cs-gpio LINE] [--cs-high]
+    Heuristic "scan" for an unknown SPI device. Sends common ID commands
+    in all four SPI modes and classifies each response:
+      [ff]    all 0xFF  - nothing driving MISO (pull-up), absent, wrong CS
+      [00]    all 0x00  - MISO held/pulled low
+      [echo]  equals TX - MOSI/MISO shorted or loopback jumper fitted
+      [DATA]  anything else - something is decoding commands  (<== marker)
+    Probes: JEDEC 0x9F, flash 0x90/0xAB/0x05, ADI reg 0, ST/InvenSense
+    WHO_AM_I, Bosch 0xD0, Bosch BMI3xx chip id (read + dummy byte).
+    Same bytes in two modes = mode-tolerant device; bit-shifted bytes =
+    wrong CPHA in those modes.
+    --cs-gpio drives a plain GPIO as chip select around each transfer.
+    Do NOT use it on a pin listed in the controller's cs-gpios (it will
+    show as in use anyway).
+    Default speed 500 kHz.
+
+
+GPIO NAMES
+----------
+Accepted forms:
+  GPIO4_IO21          i.MX bank/line (resolved by controller address,
+                      independent of gpiochip numbering)
+  4:21                same, short form
+  /dev/gpiochip3:21   explicit chip and offset
+
+Bank mapping (controller base address):
+  GPIO1 30200000   GPIO2 30210000   GPIO3 30220000
+  GPIO4 30230000   GPIO5 30240000
+
+GPIO commands refuse lines claimed by the kernel, which protects:
+  GPIO4_IO21  WiFi reset (CMP9611)
+  GPIO1_IO00  WiFi PDn#
+  camera reset, SPI chip select (GPIO5_IO09), etc.
+
+
+BOARD MAP
+---------
+I2C (Linux bus numbers):
+  bus 0  SoC I2C1   PCA9450C PMIC (normally 0x25, shows UU)
+                    TREAT AS READ-ONLY - it supplies SoC core, DRAM and
+                    I/O rails. A bad write can brown out or reset the
+                    board. For rail voltages use
+                    /sys/class/regulator/*/{name,microvolts} instead.
+  bus 1  camera     sensor 0x18 (UU when driver bound),
+                    EEPROM 0x57, device at 0x77
+
+SPI:
+  /dev/spidev1.0  ECSPI1 (30820000.spi), BMI330 IMU
+    Linux enumerates ECSPI1 as bus 1 on this board, not 0.
+    module pin 100  SCK   GPIO5_IO06
+    module pin  99  MOSI  GPIO5_IO07
+    module pin  98  MISO  GPIO5_IO08
+    module pin  97  CS    GPIO5_IO09 (kernel cs-gpios, active low)
+
+
+SPI SCANNING - LIMITS
+---------------------
+SPI has no addressing or acknowledge, so spi-probe is heuristic:
+- Write-only parts (DACs, shift registers, LED drivers, some displays)
+  never drive MISO and cannot be found this way. Use a scope.
+- With CS tied permanently active, many devices lose command framing
+  after the first transaction (flash resets its decoder on CS rising;
+  ADCs often convert on CS falling). Power-cycle between runs.
+  BMI3xx parts never leave I2C mode without a CS rising edge.
+- None of the probe commands write, but unusual parts may treat any
+  byte as a command. Check the datasheet before probing something that
+  holds valuable data.
+
+
+EXAMPLES
+--------
+  python3 hwtest.py info
+  python3 hwtest.py gpio-list
+  python3 hwtest.py i2c-scan 1
+  python3 hwtest.py i2c-read 1 0x57 0x00 32
+  python3 hwtest.py i2c-read 0 0x25 0x00 16        # PMIC, read only
+  python3 hwtest.py spi-probe 1 0                  # BMI330: 48 12 on the
+                                                   # BMI3xx line, modes 0/3
+  python3 hwtest.py gpio-toggle GPIO1_IO05 --hz 10 --count 50
+
+GPIO1_IO05 above is a placeholder; use a free line from gpio-list.
+
+
+SEE ALSO
+--------
+bmi330.py / bmi330.txt - BMI330 IMU configuration and live readout.

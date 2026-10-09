@@ -1,0 +1,172 @@
+bmm350.py - BMM350 magnetometer readout over I2C
+================================================
+
+Finds the Bosch BMM350 on the QSXP-ML81 carrier, resets it, reads its
+factory OTP compensation data, configures it and prints the compensated
+magnetic field, heading and temperature to the terminal. Optionally paces
+reads from the data-ready interrupt on GPIO1_IO27.
+
+
+REQUIREMENTS
+------------
+On target:
+  python3, python3-smbus2
+  python3-gpiod (libgpiod v2) - only for --int
+Run as root.
+
+
+INSTALL
+-------
+  scp -O bmm350.py root@<board-ip>:/mnt/userfs/
+
+
+USAGE
+-----
+  python3 bmm350.py [options]
+
+  --bus N          I2C bus      (default: search every /dev/i2c-*)
+  --addr A         0x14 or 0x15 (default: try both)
+  --odr HZ         400 200 100 50 25 12.5 6.25 3.125 1.5625 (default 100)
+  --avg N          1 2 4 8 samples averaged (default 2)
+                   limits: 400 Hz -> 1, 200 Hz -> 2, 100 Hz -> 4
+  --rate HZ        print rate (default 10)
+  --count N        lines to print, 0 = until Ctrl-C
+  --raw            raw signed 24-bit counts instead of uT / degC
+  --int            pace reads by data-ready interrupt
+  --int-gpio LINE  interrupt GPIO (default GPIO1_IO27)
+
+Examples:
+  python3 bmm350.py
+  python3 bmm350.py --bus 2 --addr 0x14
+  python3 bmm350.py --odr 50 --avg 8 --count 100
+  python3 bmm350.py --int
+
+
+WHAT THE SCRIPT DOES
+--------------------
+1. Finds the device: reads CHIP_ID (expects 0x33) at 0x14/0x15 on each
+   I2C bus, skipping addresses owned by a kernel driver. Once you know
+   the bus, pass --bus/--addr to skip the search.
+2. Soft reset (0xB6 to CMD 0x7E), 24 ms.
+3. Reads all 32 OTP words, powers OTP down, builds compensation
+   (offset, sensitivity, temperature coefficients, cross-axis terms).
+4. Magnetic reset: suspend -> bit reset (BR) -> flux-guide reset (FGR).
+5. Sets ODR/averaging, applies it, enables X/Y/Z, enters normal mode.
+6. Prints PMU_STATUS_0 and ERR_REG, then loops reading the 12-byte
+   X/Y/Z/T block from 0x31 and printing compensated values.
+7. On exit (including Ctrl-C) puts the sensor back in suspend.
+
+
+EXPECTED OUTPUT (board still, away from magnets/steel/motors)
+-------------------------------------------------------------
+  |B|     Earth field magnitude, roughly 25-65 uT depending on location.
+          Should stay about constant as you rotate the board.
+  Bx/By/Bz  change as the board is rotated; the vertical component is
+          large at mid latitudes.
+  hdg     atan2(By, Bx), board flat. Uncalibrated - hard/soft-iron
+          effects from the carrier, screws and nearby parts will skew
+          it. Use it only to see that rotation changes it smoothly
+          through 360 deg.
+  degC    near ambient.
+
+Bring a small magnet or a steel tool near the sensor: values should
+jump by tens to hundreds of uT and return when removed.
+
+With --int an extra column shows the measured interrupt rate; it should
+be close to the configured ODR.
+
+
+I2C PROTOCOL (BMM350)
+---------------------
+Read:
+  write [reg], repeated start, read N+2 bytes
+  bytes 0-1  DUMMY - discard
+  bytes 2..  data, auto-incrementing address
+Write:
+  [reg, value]   (no dummy bytes)
+
+Data registers 0x31-0x3C: X, Y, Z, T, each 24-bit signed little-endian
+(XLSB, LSB, MSB).
+
+Manual check with hwtest.py (dummy bytes included in the dump):
+  python3 hwtest.py i2c-read <bus> 0x14 0x00 3
+      -> xx xx 33     (third byte is the chip ID)
+
+Note: this is the same idea as the BMI330's SPI dummy byte, but on I2C
+and two bytes long.
+
+
+REGISTERS USED
+--------------
+  0x00 CHIP_ID          0x33
+  0x01 REV_ID
+  0x02 ERR_REG
+  0x04 PMU_CMD_AGGR_SET [5:4] averaging, [3:0] ODR
+  0x05 PMU_CMD_AXIS_EN  0x07 = X/Y/Z on
+  0x06 PMU_CMD          0x00 suspend, 0x01 normal, 0x02 apply ODR/avg,
+                        0x05 flux-guide reset, 0x07 bit reset
+  0x07 PMU_CMD_STATUS_0
+  0x2E INT_CTRL         bit7 drdy enable, bit3 output enable,
+                        bit2 push-pull, bit1 active high, bit0 latched
+                        (script writes 0x8E: pulsed, active high,
+                        push-pull, drdy on)
+  0x30 INT_STATUS
+  0x31-0x3C             MAG X/Y/Z, TEMP (24-bit each)
+  0x50 OTP_CMD          0x20|addr read word, 0x80 power off OTP
+  0x52/0x53             OTP data MSB/LSB
+  0x55 OTP_STATUS       bit0 done, bits 7:5 error
+  0x7E CMD              0xB6 soft reset
+
+ODR codes  0x2=400 0x3=200 0x4=100 0x5=50 0x6=25 0x7=12.5 ... Hz
+AVG codes  0=none 1=2 2=4 3=8
+
+Conversion and compensation follow Bosch's BMM350 SensorAPI (LSB->uT
+factors, OTP word layout, temperature and cross-axis correction). If
+readings are clearly off (|B| hundreds of uT with no magnet nearby, or
+changing with temperature), compare against your datasheet revision and
+the SensorAPI source. --raw shows the uncompensated counts.
+
+
+INTERRUPT (GPIO1_IO27)
+----------------------
+On the i.MX8M Plus, GPIO1_IO27 is the ENET_RD1 pad. If the Ka-Ro
+devicetree muxes it for Ethernet, it will not act as a GPIO and --int
+reports "no interrupt in 1 s". Check:
+  python3 hwtest.py gpio-list --all | grep IO27
+  cat /sys/kernel/debug/pinctrl/*/pinmux-pins | grep -i "enet_rd1\|gpio1_io27"
+If it is claimed by another function, a pinctrl entry muxing
+MX8MP_IOMUXC_ENET_RD1__GPIO1_IO27 is needed in the carrier dtsi
+(same pattern as imx8mp-bmi330-spi.dtsi).
+
+Polling mode (no --int) works regardless of the interrupt pin.
+
+
+TROUBLESHOOTING
+---------------
+  "no BMM350 found"        wrong bus; run hwtest.py i2c-scan on each bus
+                           and look for 0x14 or 0x15
+  OTP timeout / error      I2C marginal (pull-ups, speed) or wrong device
+  readings all 0 or fixed  not in normal mode - check PMU_STATUS_0 and
+                           ERR_REG lines at startup
+  |B| far from 25-65 uT    nearby magnet/steel, or compensation mismatch
+                           (try --raw to see if counts move sensibly)
+  --int: no interrupt      pinmux (see above), INT wiring, or INT_CTRL
+                           bit layout differs in your datasheet rev
+
+
+HARDWARE
+--------
+  BMM350 SCK -> I2C_SCL_B
+  BMM350 SDA -> I2C_SDA_B
+  BMM350 INT -> GPIO1_IO27
+  Address 0x14 (ADSEL low) or 0x15 (ADSEL high)
+
+Which Linux /dev/i2c-N corresponds to I2C_B depends on the Ka-Ro
+devicetree; the auto-search finds it. Record the bus number here once
+known: bus ___  addr ____
+
+
+SEE ALSO
+--------
+hwtest.py / hwtest.txt  - i2c-scan, i2c-read, gpio-list
+bmi330.py / bmi330.txt  - BMI330 IMU over SPI

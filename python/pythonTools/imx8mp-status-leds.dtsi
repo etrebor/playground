@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * RGB status LED on GPIO4_IO23/24/25 (SAI2 pads) -> /sys/class/leds/{red,green,blue}
+ *
+ *   SAI2_TXFS  / GPIO4_IO24 -> LED_RED
+ *   SAI2_RXD0  / GPIO4_IO23 -> LED_GREEN
+ *   SAI2_TXC   / GPIO4_IO25 -> LED_BLUE
+ *
+ * If the LEDs are wired pin-sinks-current (cathode to the SoC pin),
+ * change GPIO_ACTIVE_HIGH to GPIO_ACTIVE_LOW.
+ * These pads must not be claimed by &sai2 or another pinctrl group.
+ *
+ * Also muxes I2C4_SCL / GPIO5_IO20 as a plain GPIO input (read from user
+ * space by bq35100_run.py). It sits in this group only so the pad gets
+ * muxed when gpio-leds probes; &i2c4 must not be enabled.
+ * Button: normally open to GND, external 10k pull-up to 3V3 -> pressed = low.
+ * Pad 0x1c0 = pull-up + hysteresis (internal pull-up matches the external one).
+ */
+
+/ {
+	status-leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_status_leds>;
+
+		led-red {
+			label = "red";
+			gpios = <&gpio4 24 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-green {
+			label = "green";
+			gpios = <&gpio4 23 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-blue {
+			label = "blue";
+			gpios = <&gpio4 25 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
+};
+
+&iomuxc {
+	pinctrl_status_leds: status-ledsgrp {
+		fsl,pins = <
+			MX8MP_IOMUXC_SAI2_TXFS__GPIO4_IO24	0x140
+			MX8MP_IOMUXC_SAI2_RXD0__GPIO4_IO23	0x140
+			MX8MP_IOMUXC_SAI2_TXC__GPIO4_IO25	0x140
+			MX8MP_IOMUXC_I2C4_SCL__GPIO5_IO20	0x1c0
+		>;
+	};
+};

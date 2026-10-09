@@ -1,0 +1,171 @@
+liquidlens.py - MAX14574 liquid lens driver test tool
+=====================================================
+
+Tests the Maxim MAX14574EWL 4-channel high-voltage liquid lens driver on
+the camera I2C bus. Register map and behaviour from the Maxim MAX14574
+datasheet (Rev 0, 12/10). All results print to the console.
+
+
+HARDWARE
+--------
+  I2C bus 1 (I2C_A, shared with camera 0x18 / EEPROM 0x57)
+  Address 0x77 (datasheet 8-bit 0xEE write / 0xEF read)
+  EN pulled high on the carrier: chip never in hardware shutdown.
+  Registers reset to 0x00 at power-up; chip starts in sleep, outputs off.
+  Outputs LL1-LL4 and COM to the lens; boost output VH (~70.5 V).
+
+Install:  scp -O liquidlens.py root@<board-ip>:/mnt/userfs/
+Needs:    python3, python3-smbus2, root.
+
+
+OUTPUT WAVEFORM - READ BEFORE MEASURING
+---------------------------------------
+Each output LL_ - COM is a 3-level wave at 5 kHz (4.5-5.5 kHz):
+  +Vpeak, 0, -Vpeak, 0      Vpeak ~70.5 V (68.7-72.3), ~141 V peak-peak
+Amplitude is FIXED. The code changes the duty cycle (pulse width):
+  Vrms = 24.4 V + 44.5 mV x code       code 0..1023
+  duty = (Vrms / Vpeak)^2              ~12 % at code 0, ~98 % at 1023
+  code 0 -> 24.4 Vrms, 512 -> 47.2 Vrms, 1023 -> ~69.7-69.9 Vrms
+Datasheet output RMS error: +/-2.5 %. Edges 0.15-2.5 us.
+
+COM and LL_ each swing 0 to ~70 V relative to ground.
+
+  Scope   Differential probe across LL_ and COM, or CH1 on LL_, CH2 on
+          COM (both to board GND) and display CH1 - CH2. Never clip a
+          ground lead to LL_ or COM. Check probe voltage rating.
+          Expect constant +/-70 V height; pulse width follows the code.
+          Use the scope's RMS measurement on the math trace.
+  Meter   True-RMS AC across LL_ and COM. A 5 kHz pulse wave with fast
+          edges exceeds many handheld meters' AC bandwidth - expect
+          readings to drift low at small duty. The scope RMS is the
+          reference; use the meter for relative checks.
+  VH      Simple DC check: DC volts on the VH capacitor to GND reads
+          ~70.5 V while the output is on (BST_FAIL=0).
+  Load    Probe capacitance adds to the lens load (75 pF in datasheet
+          conditions); 10x probes are fine.
+
+
+SAFE COMMANDS (no high voltage)
+-------------------------------
+info
+    Decode registers 0x00-0x0A: chip revision, thermal/boost flags,
+    fail bits, sleep/active state, startup and current-limit config,
+    the four channel codes with their Vrms. First thing to run.
+
+temp [--count N] [--interval S] [--ext]
+    Enables the internal temperature sensor (leaves sleep if needed, does
+    not enable outputs) and prints Tj = (TS - 127) x 1.6 C - 60 C.
+    A plausible room temperature proves the chip's internal circuitry and
+    I2C path are alive.
+    --ext reads the carrier thermistor instead: RT1 (NTCG064EF104FTNX,
+    100k NTC) between TM2-TM1, R32 82k TM1-GND. Code = 255 x V_TM1/V_TM2,
+    RT1 = 82k x (255/code - 1); ~0x73 (115) at 25 C. NTC_B at the top of
+    the script must match the TDK datasheet. Code 0x00/0xFF suggests the
+    thermistor path is open or shorted (check R30, R31 population).
+    NOTE: temp sets SM=1 (leaves sleep) - see CARRIER NOTES about C30.
+
+dump [--count N] | watch REG... | write REG VAL...
+    Raw register access. write sends VAL bytes with register
+    autoincrement and reads them back.
+
+
+HIGH-VOLTAGE COMMANDS
+---------------------
+Common options:
+  --ch all|1|1,3   channels to set (default all - pure focus, no tilt)
+  --force          skip electrode difference check
+  --fstu 0-3       boost startup 6.4/3.2/0.8/0.4 ms (default 0, gentlest)
+  --il 0-3         inductor current limit 270/410/570/720 mA (default 0)
+                   (global options, put before the command:
+                    liquidlens.py --il 1 set 512)
+
+check
+    Built-in open/short test (CHK_FAIL). Takes ~2 ms, then prints the Fail
+    register: FAIL_OP open, FAIL_SH short, COM_FAIL, LL1-4_FAIL.
+    Channels not wired to a lens electrode report as failed - compare
+    with how many electrodes your lens uses.
+
+set CODE [--hold S] [--leave-on]
+    Enables the driver, writes the code, issues UPD_OUT and confirms the
+    chip cleared it ("updated" = outputs really switching). Prints
+    expected Vrms and duty. Holds until Enter (or S seconds), then turns
+    the output off (ACTIVE=0, sleep).
+
+step START STOP STEP
+    Manual measurement run: prompts "measured Vrms" at each code; type
+    the reading (Enter skips, q quits). Ends with a table of expected,
+    measured, error and error % against the +/-2.5 % spec.
+
+sweep START STOP STEP [--dwell S] [--cycles N] [--bounce]
+    Automatic sweep for scope/logger. --cycles 0 runs until Ctrl-C.
+
+off
+    ACTIVE=0 (outputs pulled down) and SM=0 (sleep).
+
+Every high-voltage command turns the output off on exit or Ctrl-C,
+except set --leave-on.
+
+
+SAFETY LIMITS IN THE SCRIPT
+---------------------------
+  CODE_MAX (top of script)  highest code allowed, default 1023
+                            (69.7 Vrms). Lower it if the lens is rated
+                            below that.
+  Electrode differences     refused unless --force:
+                            > 27 Vrms between any two channels
+                            > 19 Vrms between adjacent channels
+                            (ring LL1-LL2-LL3-LL4-LL1)
+                            These are the datasheet test conditions.
+  Defaults FSTU=0, IL=0     slowest boost start, lowest inductor current.
+                            If BST_FAIL appears, try --il 1 (datasheet
+                            curves use IL=01, FSTU=10) - first check the
+                            carrier inductor's saturation current covers it.
+
+
+STATUS FLAGS
+------------
+  "updated"             UPD_OUT cleared by the chip: output switching
+  "UPD_OUT NOT CLEARED" chip did not apply the update (not ACTIVE, or
+                        not responding)
+  BST_FAIL              VH not reaching ~70.5 V: inductor, diode, VH cap,
+                        current limit too low, overload/short
+  LL_TH                 thermal shutdown occurred
+
+
+SUGGESTED TEST SEQUENCE
+-----------------------
+ 1. info                       chip responds, REV, everything 0 after POR
+ 2. temp                       sensible Tj -> chip alive
+ 3. check                      open/short per channel
+ 4. set 0 --hold 60            meter VH (~70.5 V DC); scope LL_-COM:
+                               +/-70 V pulses, ~12 % duty, 24.4 Vrms
+ 5. set 512 --hold 60          ~45 % duty, ~47.2 Vrms
+ 6. step 0 1023 128            record readings, check the error table
+ 7. sweep 0 1023 64 --bounce --cycles 0 --dwell 0.5
+                               watch pulse width track on the scope;
+                               look at the lens/image for focus change
+ 8. off
+
+
+CARRIER NOTES (schematic U10)
+-----------------------------
+  VDD 3V3 (C29 4.7uF, C28 0.1uF); L2 3V3->LX; D1 LX->VH; C30 on VH.
+  SDA/SCL via R26/R27 (0R) from CAM_LL_SDA/SCL = I2C_A = bus 1.
+  Lens: LL1 via R34 (0R), COM via R33 (5.1k) to the lens connectors
+  J7/J8. LL2-LL4 unconnected -> 'check' reports them open (expected).
+  R33 5.1k in series with COM forms an RC with the lens capacitance and
+  slows the edges; measure at the lens connector and at the chip if
+  results differ.
+
+  C30 (VH bypass) is marked 0.1uF/10V on the schematic. The datasheet
+  requires > 75 V rating (VH ~70.5 V). Confirm the fitted part's voltage
+  rating BEFORE any command that leaves sleep (temp, check, set, step,
+  sweep). info and dump never leave sleep.
+  Also confirm D1 is rated >= 75 V reverse and L2 saturation current
+  covers the IL setting (default 270 mA).
+
+
+SEE ALSO
+--------
+README.txt - index of all test tools
+hwtest.py  - i2c-scan 1 shows 0x77

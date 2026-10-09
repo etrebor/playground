@@ -1,0 +1,36 @@
+rgbled.py - carrier RGB status LED
+==================================
+
+Sets the carrier's RGB status LED from the console.
+
+  red    GPIO4_IO24
+  green  GPIO4_IO23
+  blue   GPIO4_IO25
+
+USAGE
+-----
+  python3 rgbled.py        all off
+  python3 rgbled.py -r     red on,   green + blue off
+  python3 rgbled.py -g     green on, red + blue off
+  python3 rgbled.py -b     blue on,  red + green off
+
+Only one of -r/-g/-b may be given. Every run prints the resulting state,
+e.g.  red=ON  green=off  blue=off   (sysfs)
+
+HOW IT DRIVES THE LED
+---------------------
+Normally through /sys/class/leds/{red,green,blue}, created by the
+gpio-leds node in imx8mp-status-leds.dtsi. With that node active the
+GPIO lines belong to the LED driver, so direct GPIO access is refused;
+sysfs is the only way in, and the LED polarity comes from the devicetree.
+
+Fallback: if the sysfs entries are missing (older dtb without the node),
+the script drives the GPIO4 lines directly with python3-gpiod (libgpiod v2).
+Add --active-low in that case if the LED is lit by a low pin.
+
+Needs: python3, root. python3-gpiod only for the fallback.
+
+NOTE
+----
+bq35100_run.py also drives this LED while it runs; whichever writes last
+wins.

@@ -1,0 +1,78 @@
+# Context: QSXP-ML81 bring-up — session summary (2026-10-09)
+
+## Terminology (use consistently)
+- "som" = Ka-Ro QSXP-ML81; "module" = CEL CMP9611 WiFi; "i.MX" = i.MX8M Plus chip
+- Any i.MX pin mentioned must carry its som pin as (som:pNN), or (NC) if not on a som pin
+
+## Hardware
+- som: Ka-Ro QSXP-ML81 (i.MX8M Plus, 2GB LPDDR4, 8GB eMMC on uSDHC3, internal)
+- module: CEL CMP9611 (NXP IW611, reports as SDIW612) on SDIO uSDHC2
+  - SDIO GPIO2_IO13-18 (som:p?? – to confirm), WiFi reset GPIO4_IO21/SAI2_RXFS (som:p?? – to confirm), PDn# GPIO1_IO00 (som:p?? – to confirm)
+- Power: USB OTG only. Boot select jumper on som pin 52 (BOOT_MODE0): low=eMMC, high=USB SDP
+- Carrier has WiFi only, no wired Ethernet (som has EQOS + PHY, but not brought out)
+- Camera (not started): PHYTEC board S001986C0 / 1513.1, cable AXON AWM 2896, 4 MIPI lanes desired
+- Build host: Ubuntu 24.04 VM in VirtualBox on Windows 11
+
+## Yocto
+- Ka-Ro BSP scarthgap, MACHINE=qsxp-ml81, DISTRO=karo-minimal, kernel linux-karo 6.6.52 (NOT linux-imx), U-Boot u-boot-karo 2025.07
+- Build dir: ~/karo-nxp-bsp/build-qsxp-ml81
+- Custom layer: ~/karo-nxp-bsp/sources/meta-cmp9611-wifi (git repo; priority reports 10)
+- meta-oe and meta-python present
+- linux-karo uses kernel.bbclass + cml1 → .cfg fragments must be cat'ed in do_configure:append()
+
+## Prior working state (before this session)
+- WiFi: mlan.ko + moal.ko, `modprobe moal fw_name=nxp/sd_w61x_v1.bin.se` → mlan0, AP + DHCP OK
+- dropbear SSH works after manual modprobe
+- Cold boot from eMMC works; NXP driver needed CONFIG_ANDROID_KERNEL=n, CONFIG_CFG80211 fragment
+
+## Done this session
+1. Cloned the build VM; working clone hostname: SafeKaro-ubuntu24-04-PY (original VM kept as known-good)
+2. Added recipes-core/images/karo-image-minimal.bbappend (uncommitted at last check — commit it):
+   IMAGE_INSTALL:append = " python3 python3-modules python3-gpiod libgpiod-tools
+     python3-smbus2 i2c-tools python3-spidev e2fsprogs-resize2fs"
+   IMAGE_ROOTFS_MAXSIZE = "3000000"
+   - Resolved: python3-gpiod 2.1.3 (libgpiod v2 API — v1 examples won't work), smbus2 0.4.3, spidev 3.6
+3. Built clean; rootfs ext4 = 171MB (old 128MB partition was 96% full before Python)
+4. Repartitioned via uuu: rootfs 128MB → 3GiB
+   - Flash script is hand-maintained: ~/uuu-flash/uuu.auto.full (backup uuu.auto.full.orig)
+   - GPT line: boot start=1MiB size=65536KiB; rootfs size=3145728KiB; userfs size=MAX
+   - Script already uses -raw2sparse and re-applies U-Boot env (bootcmd_mmc, append_bootargs, saveenv)
+   - Generated uuu.auto in tmp/deploy is NOT used (would be overwritten by template anyway)
+   - After each build, copy karo-image-minimal-qsxp-ml81.ext4 into ~/uuu-flash/
+5. Jumperless flashing works: at U-Boot prompt `fastboot usb 0`, then `uuu uuu.auto.fb`
+   - uuu.auto.fb = uuu.auto.full minus SDPS line, plus first line `FB: ucmd setenv emmc_boot_part 1`
+   - usb 0 = usb@38100000 (USB1, peripheral, same port as SDP); USB2 is host-only
+   - Earlier failure was a bad cable; existing NXP VirtualBox USB filter matches fastboot device
+   - Keep jumper/SDP path for recovery
+6. On target: userfs resized to 3.9G OK; `python3 -c "import gpiod, smbus2, spidev"` → ok
+   - rootfs resize2fs FAILED: rootfs is mounted read-only (karo-minimal read-only-rootfs;
+     tmpfs /var,/run with /etc/.var,/etc/.run binds). `df` still shows / = 154.6M, 98% used
+
+## Immediate next step
+- On target: `mount -o remount,rw /` → `resize2fs /dev/mmcblk0p2` → `df -h /` (~2.9G) → reboot
+- Confirm with `grep " / " /proc/mounts`
+
+## Read-only rootfs implications
+- Scripts, configs, recorded video → /mnt/userfs (rw)
+- Package installs / writes to /usr need remount rw
+- WiFi credentials: bake into image or keep on userfs
+
+## Remote update strategy (WiFi only, U-Boot has no WiFi)
+- USB (uuu, SDP or fastboot): U-Boot, GPT, full reflash — local only
+- Over SSH: kernel/DTB by writing p1 (unmounted), e.g. `cat bootfs.ext4 | ssh root@ip "dd of=/dev/mmcblk0p1 bs=1M && sync"`
+- Possible later: package feed (needs VirtualBox Bridged adapter), A/B rootfs (RAUC/SWUpdate)
+- scp from Ubuntu 24.04 to dropbear needs `scp -O`
+
+## Outstanding / queued
+1. Finish rootfs resize (above)
+2. Auto-start at boot: moal load with fw_name, wpa_supplicant + DHCP on mlan0, dropbear (prerequisite for any remote work)
+3. Kernel userspace I/O: fragment userspace-io.cfg (GPIO_CDEV, I2C_CHARDEV, SPI, SPI_IMX, SPI_SPIDEV)
+   cat'ed in do_configure:append; spidev DT node (compatible "rohm,dh2228fv") on carrier ECSPI
+   — need carrier ECSPI/I2C instances + pads (with som pins)
+4. Camera: BSP warns preferred version 4.2.2.24+basler not available for basler-camera,
+   kernel-module-isp-vvcam, isp-imx (available 4.2.2.24.x) — resolve at camera step
+   Goals in order: drivers/control SW via Yocto → no errors → capture to file → live view via VNC
+5. Bluetooth deferred (IW611 BT is UART)
+6. PDn#/reset sequencing vs CMP9611 datasheet not formally verified
+7. Optional: trim nxpwifi-all-sdio firmware to w61x only
+8. Don't put Python/I/O tools on the camera sensor's I2C bus while the sensor driver owns it

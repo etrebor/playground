@@ -1,0 +1,78 @@
+# Handoff summary — QSXP-ML81 + PHYTEC camera bring-up (AR0521)
+
+Paste this into a new AI chat to continue. Terminology: **som** = Ka-Ro QSXP-ML81, **module** = CEL CMP9611 (WiFi/BT), **i.MX** = the i.MX8M Plus itself. Every i.MX pin is listed with its som pin as (som:pNN), or (NC) if not on a som pin.
+
+## Platform
+- Ka-Ro QSXP-ML81 som (i.MX8M Plus, 2 GB, 8 GB eMMC) on a custom carrier. Yocto, Ka-Ro BSP scarthgap: MACHINE `qsxp-ml81`, DISTRO `karo-minimal`, kernel `linux-karo` 6.6.52 (NXP-based, lf-6.6.y-karo-2), U-Boot `u-boot-karo` 2025.07 (`default` variant flashed to mmc0boot0).
+- Build host: Ubuntu 24.04 in VirtualBox on Windows 11. Build dir `~/karo-nxp-bsp/build-qsxp-ml81`. Flashing via uuu from `~/uuu-flash/`.
+- eMMC: p1 boot (ext4, kernel `Image` + dtb/dtbo), p2 rootfs (mounted read-only by design), p3 userfs mounted at `/mnt/userfs` (persistent storage).
+- Custom layer: `~/karo-nxp-bsp/sources/meta-phytec-vm117` (priority 16).
+
+## Camera hardware
+- Camera on the bench: **PHYTEC VM-017 (phyCAM-M)**, etched S001964C4, ON Semi **AR0521**, 27 MHz on-board oscillator, EEPROM at i2c 0x57. Sensor answers at **i2c 0x18** (not the documented 0x36/0x37).
+- Also on hand: VM-117-M mini (etched S001986C0). Its address has never been checked cleanly; scan with reset held deasserted before using it.
+- phyCAM-M connector wiring, all verified by continuity:
+  - I2C: I2C2_SCL GPIO5_IO16 (som:p5) → CAM.P9; I2C2_SDA GPIO5_IO17 (som:p6) → CAM.P8. Linux bus `i2c-1` (30a30000.i2c). Same bus also has a MAX14574 liquid-lens driver at 0x77.
+  - nRESET: GPIO1_IO28 (som:p28) → CAM.P6, active low. I2C_ADDR: GPIO1_IO29 (som:p29) → CAM.P7, left open.
+  - CTRL1 GPIO1_IO22 (som:p30), CTRL2 GPIO1_IO23 (som:p31), CTRL3/CTRL4 on som:p35/p34 (unused).
+  - CSI_A, 4 lanes: D0 N/P som:p60/p59 → CAM.28/29; D1 som:p58/p57 → 25/26; D2 som:p56/p55 → 19/20; D3 som:p54/p53 → 16/17; CLK N/P som:p62/p61 → 22/23.
+  - VCAM 3.3 V (CAM.P5 VCC_SELECT open), measured steady during streaming.
+
+## What's in meta-phytec-vm117 (linux-karo bbappend)
+`recipes-kernel/linux/linux-karo_%.bbappend`: FILESEXTRAPATHS + SRC_URI for the three files below. `do_configure:append` cats the `.cfg` onto `.config`, copies the `.dtsi` into the kernel tree and appends `#include` to `imx8mp-qsxp-ml81.dts`.
+
+1. **`imx8mp-qsxp-ml81-vm117.dtsi`**
+   - `#include "imx8mp-pinfunc.h"`
+   - `/ { vm117_extclk: fixed-clock 27000000 }`
+   - `&i2c2 { camera@18: compatible "onnn,ar0521", reg <0x18>, clocks extclk, reset-gpios <&gpio1 28 GPIO_ACTIVE_LOW>, pinctrl (ENET_RD2__GPIO1_IO28 0x19), port endpoint data-lanes <1 2 3 4> }`
+   - `&mipi_csi_0 { status okay; port@0 endpoint: remote ar0521, data-lanes <4>, csis-hs-settle <17> }`. **17 is still a placeholder; see current issue.**
+   - `&cameradev { status okay }` and `&isi_0 { status okay; cap_device { status okay } }`
+2. **`ar0521-enable.cfg`**
+   - Media core: MEDIA_SUPPORT, MEDIA_CAMERA_SUPPORT, VIDEO_DEV=m, MEDIA_CONTROLLER, V4L2_SUBDEV_API, VIDEO_CAMERA_SENSOR, VIDEO_AR0521=m.
+   - TV, radio, SDR, test and tuner branches explicitly not set. Forcing MEDIA_SUPPORT=y alone pulled in **CONFIG_DVB_CORE=y**, which caused a hard reboot loop right after "software IO TLB" at boot.
+   - NXP staging camera stack: STAGING=y, STAGING_MEDIA=y, VIDEO_IMX_CAPTURE, IMX8_MEDIA_DEVICE, IMX8_MIPI_CSI2_SAM, IMX8_ISI_HW/CORE/CAPTURE/M2M (all =m).
+   - Explicitly off: IMX8_MIPI_CSI2, GMSL_MAX9286, IMX8_PARALLEL_CSI, DWC_MIPI_CSI2_HOST, and the mainline VIDEO_IMX8_ISI / VIDEO_IMX8MQ_MIPI_CSI2. This kernel's DT uses NXP nodes (`fsl,mxc-md`, `fsl,imx8mp-mipi-csi`, `fsl,imx8mp-isi`), which only the staging drivers match.
+3. **`ar0521-debug-errno.patch`** (5 hunks, generated with `diff -u` against `git show HEAD:drivers/media/i2c/ar0521.c`)
+   - Post-reset `usleep_range(4500,5000)` changed to **`msleep(100)`**. This was the root cause of `I2C write error` (-ENXIO): the sensor NAKs until it has finished booting.
+   - No-op `link_setup` + `media_entity_operations` (with `v4l2_subdev_link_validate`), set via `sd.entity.ops`. NXP mxc-md failed with -515 without it.
+   - No-op `s_power` in core ops. NXP ISI → CSI → sensor `s_power` made STREAMON fail with ENOTTY without it. Power is handled by runtime PM in `s_stream`.
+   - Debug `v4l2_err` lines logging addr/flags/len per write and the i2c_transfer errno. Noisy; remove later.
+
+## Current state (as of 2026-10-09)
+- Boots cleanly. Pipeline is up: `ar0521 1-0018 → mxc-mipi-csi2.0 → mxc_isi.0 → mxc_isi.0.capture`. `/dev/video0`, `/dev/media0`, `/dev/v4l-subdev0` (CSI), `/dev/v4l-subdev1` (sensor).
+- Sensor format SGRBG8_1X8 2592×1944. ISI offers `GRBG` passthrough at up to 2592×1944.
+- `VIDIOC_STREAMON` succeeds. Sensor frame counter (reg 0x303A) rises at ~60 fps, and 0x301A = 0x023C (stream bit set). **The sensor is transmitting.**
+- **The CSI receiver doesn't lock:** the CSI IRQ count rises by 1 per stream start, the ISI IRQ count stays at 0, and `v4l2-ctl -d /dev/v4l-subdev0 --log-status` shows `SOT Error events: 1`. Captured file is 0 bytes.
+- Link rate: 184 MHz pixel rate × 8 bpp / 4 lanes = **368 Mbit/s per lane**. The mainline CSIS formula `(rate − 5 M)/45 M` gives hs-settle ≈ **8**.
+- Tried: hs-settle 17 and hs-settle 8 alone (no change). hs-settle 17 + `csis-clk-settle <2>` + `csis-wclk` was applied (dmesg confirmed `clk_settle: 2, wclk: 1`), but the test result hasn't been reported yet.
+- ISI log prints `input fmt YUV4` / `output fmt GRBG`. This may matter once data actually reaches the ISI.
+
+## Next steps
+1. Test hs-settle 8 + clk-settle 2 + wclk together. Edit the DT in U-Boot, with `bootcmd_mmc` run only once:
+   ```
+   run bootcmd_mmc
+   fdt addr ${fdt_addr}
+   fdt resize 4096
+   fdt set /soc@0/bus@32c00000/camera/csi@32e40000/port@0/endpoint csis-hs-settle <8>
+   fdt set /soc@0/bus@32c00000/camera/csi@32e40000/port@0/endpoint csis-clk-settle <2>
+   fdt set /soc@0/bus@32c00000/camera/csi@32e40000/port@0/endpoint csis-wclk
+   run bootm_cmd
+   ```
+   Verify with `dmesg | grep hs_settle`, then watch `/proc/interrupts` (32e40000.csi / 32e00000.isi) during a background `v4l2-ctl --stream-count=100 --stream-to=/dev/null`, plus `--log-status`.
+2. If there's still no lock: try hs-settle 13 (NXP reference) and sweep 6–10. Then try putting the sensor in continuous MIPI clock mode (its init writes 0x31BC = 0x068C, a non-continuous clock).
+3. Once ISI interrupts flow:
+   - Capture with `v4l2-ctl -d /dev/video0 --set-fmt-video=width=2592,height=1944,pixelformat=GRBG --stream-mmap --stream-count=1 --stream-to=/mnt/userfs/frame.raw`. Expect 5,038,848 bytes.
+   - Convert on the PC: `ffmpeg -f rawvideo -pixel_format bayer_grbg8 -video_size 2592x1944 -i frame.raw frame.png`.
+   - Put the working CSI values into the `.dtsi` permanently (dtb-only change, so bootfs rebuild only).
+4. Later goals: remote live view over VNC (needs GStreamer, now that rootfs has more room); decide whether to keep or upstream-clean the patch (shorter delay, drop debug); optionally the PHYTEC `phycam-ar0521` + vvcam ISP path for proper image quality.
+
+## Workflow gotchas learned
+- `ar0521` is `=m`. Any `ar0521.c` change needs `bitbake karo-image-minimal` and a **rootfs** reflash; bootfs alone only carries `Image` + dtb.
+- Modules are built by `do_compile_kernelmodules`, not `do_compile`.
+- Before every flash, check the **deploy-dir symlink target timestamp** (`ls -la tmp/deploy/images/qsxp-ml81/*.ext4`), not the mtime of the copy. A stale bootfs in `~/uuu-flash` caused a false "regression" once.
+- Check builds without flashing: `strings`/`nm` on `.../build/drivers/media/i2c/ar0521.o`, and on target `strings /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ar0521.ko`.
+- Generate patches with `diff -u` from pristine plus edited copies. Hand-edited hunk headers silently dropped lines once.
+- `/tmp` on the build VM is wiped on reboot; keep working files elsewhere.
+- Board is BusyBox: no `timeout`, no `dmesg -C` (use `dmesg -c`), no `lsblk`/`findmnt`.
+- A failed or removed ar0521 probe leaves the sensor held in reset, so it vanishes from `i2cdetect`. Sysfs GPIO exports don't survive reboot, and a leftover export blocks the driver's `gpiod_get`.
+- U-Boot `fdt set` of a new property needs `fdt resize` first (FDT_ERR_NOSPACE). Running `bootcmd_mmc` again reloads the DTB and discards edits.

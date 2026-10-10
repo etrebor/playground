@@ -1,0 +1,90 @@
+Session summary for an AI assistant: QSXP-ML81 carrier bring-up (Bob)
+Terminology (user preference)
+module = CEL CMP9611 (NXP IW611; identifies internally as SDIW612).
+som = Ka-Ro QSXP-ML81.
+i.MX = the i.MX8M Plus chip.
+Always give i.MX pins with their som pin, e.g. GPIO5_IO22 (som:p93), or (NC) if not connected to a som pin.
+All schematic pin numbers are som pins unless prefixed module:.
+Environment
+Build PC: Ubuntu 24.04 VM, host SafeKaro-ubuntu24-04-PY, user bob.
+BSP: ~/karo-nxp-bsp; build dir ~/karo-nxp-bsp/build-qsxp-ml81. Ka-Ro scarthgap, machine qsxp-ml81, distro karo-minimal, kernel linux-karo 6.6.52.
+Environment setup: cd ~/karo-nxp-bsp && source setup-environment build-qsxp-ml81 (must be run from the BSP top level).
+Layers:
+meta-cmp9611-wifi: WiFi, Bluetooth and the wifi dtsi, at recipes-kernel/linux/linux-imx/imx8mp-cmp9611-wifi.dtsi.
+meta-phytec-vm117: camera, BMI330, status LEDs; its bbappend stages the dtsi files and config fragments and runs oldconfig.
+Board:
+Busybox userland. The rootfs is read-only (mount -o remount,rw /).
+Userfs at /mnt/userfs is persistent; tools live in /mnt/userfs/pythonTools.
+IP changes (recently 172.16.30.2 / .28).
+Use scp -O (no sftp-server on the board).
+DHCP client is dhcpcd, not udhcpc.
+After a full uuu flash: Bob recreates wpa_supplicant.conf on the serial console himself, then scps pythonTools.tar and the conf.
+dtb-only deploy:
+Build PC: bitbake linux-karo.
+Board: mkdir -p /tmp/boot && mount /dev/mmcblk0p1 /tmp/boot.
+Build PC: scp -O $DEPLOY/imx8mp-qsxp-ml81.dtb root@<ip>:/tmp/boot/.
+Board: sync && umount /tmp/boot, then a full power-cycle.
+The board has a backup at imx8mp-qsxp-ml81.dtb.bak.
+Completed and working
+ATtiny1616 firmware bq35100_monitor.c (Microchip Studio, avr-gcc; utoa replaced with a local routine).
+UART: PA1/PA2 UART ↔ som UART_B (/dev/ttymxc1), 115200, LF line endings.
+Outputs to the BQ35100: GE on PB3.
+PA4 (board power): high at reset.
+PB5: input at boot (external pull-up). ~forcebat+ = output low, ~forcebat- = input. Each PA5 button press toggles it (output high ↔ input). At the end of the ~PWR- timer it’s forced to output high.
+Inputs: ALERT on PB2 (no clearing; one alert per GE session). PA5 button, active low, debounced: btn+ / btn-. PB4 reported as 5v on/off after each voltage read. PC3 reported as status on/off, and err is sent if PC3 equals PB4.
+Commands:
+~GE+ / ~GE- → GE ON / NOACK / GE OFF.
+~PWR- → PA4 low after 10 s, then PB5 output high 10 s later. ~PWR+ cancels.
+~cal2 → unseal, EXTVCELL=1, 2 cells, RESET. ~vcal<mV>\n → VIN gain calibration. Both reply with CAL … lines ending in CAL DONE or CAL ERR.
+BQ35100: 2-cell pack (~6.1 V) via VIN through a 160k/16.5k divider; BAT unused. REGIN fixed. Calibration done and working. It needed a temporary BAT→REGIN jumper for the flash write, because writes need Voltage() ≥ 2800 mV.
+bq35100_run.py (on the SoM):
+Runs a timed GE+ → log → GE- → ~PWR- → poweroff sequence.
+Options: --no-poweroff, --log, --forcebat (sends ~forcebat+ after the baseline), --calibrate, --vcal MV.
+LED via sysfs:
+Green at start.
+Baseline is the average of the first 3 readings; the rolling 3-reading average more than 1 V below → blue, more than 2 V below → red.
+Button events: ATtiny button pressed → red + blue, SoM button (GPIO5_IO20 (som:p7), via gpiod) pressed → green + blue, either released → green. Each holds the LED for 3 s.
+err → red blinking at 0.2 s, clearing 1.2 s after the last err.
+Logs 5V and Status lines.
+rgbled.py: -r / -g / -b, or no argument for all off. Uses sysfs, with a gpiod fallback.
+README.md covers all of the above.
+imx8mp-status-leds.dtsi (meta-phytec-vm117):
+gpio-leds red GPIO4_IO24, green GPIO4_IO23, blue GPIO4_IO25.
+SoM button GPIO5_IO20 in its own group on &gpio5 (pad 0x1c0).
+&i2c4 disabled (it owned the pad).
+Verified: rgbled.py -g prints (sysfs).
+WiFi: /etc/init.d/cmp9611-wifi auto-starts it. The script unloads the driver at shutdown (fixes warm reboot) and retries with an SDIO rebind. A recipe cmp9611-wifi-init exists, plus SERIAL_CONSOLES:qsxp-ml81 = "115200;ttymxc0" (gettys on ttymxc1/2 had broken the ATtiny link).
+Clean full rebuild done 2026-10-07; the image is flashed.
+Reminder for the next build: the wifi dtsi #include sits at line 10 of the board dts even on a clean build, so it comes from a layer file (likely Ka-Ro’s copy in meta-karo-nxp). Move it to the meta-cmp9611-wifi bbappend’s include loop.
+Camera patch ar0521-debug-errno.patch (meta-phytec-vm117) combines debug logging with the msleep(100) post-reset fix. New last goal: “Determine if patch should be removed”. Suggestion: drop the logging and keep the delay as its own patch.
+Bluetooth: in progress (main open item)
+Wiring (som → module):
+som pin	som signal	module pin	module signal
+p93	UART_RXD_C	38	UART_TX
+p94	UART_TXD_C	39	UART_RX
+p95	UART_RTS_C	36	UART_CTS
+p96	UART_CTS_C	37	UART_RTS#
+p19	GPIO4_IO22	31	BT_DIS#, active low, 4.7k pull-up
+Module strap module:19 (Host_Config[0]) is open; module:18 VIO = 3.29 V.
+Measured and fixed:
+Crossed pairs: on the real hardware, module:39 drives and module:38 receives (two outputs fought, giving 1.1 V lows). Fixed with UART1 DTE mode: UART1_RXD → DTE_TX (som:p93 → module:38), UART1_TXD → DTE_RX (som:p94 ← module:39). Both data lines now swing cleanly 0–3.3 V.
+Flow control: turned off (/delete-property/ uart-has-rtscts). GPIO5_IO27 (som:p95) is held low by the hog bt-uart-cts-force-low; GPIO5_IO26 (som:p96) is a plain input. module:36 and module:37 both read low.
+BT reset: U-Boot left GPIO4_IO22 (som:p19) driven low. Released by the hog bt-reset-release (input); it reads 3.29 V.
+UART1 clock: it ran from the 24 MHz oscillator (base_baud = 1500000), so 3 Mbaud was impossible. Added assigned-clocks = <&clk IMX8MP_CLK_UART1>; assigned-clock-parents = <&clk IMX8MP_SYS_PLL1_80M>; plus #include <dt-bindings/clock/imx8mp-clock.h>.
+Driver behaviour:
+At boot, btnxpuart always says FW already running, then -110 timeouts. The bootloader signature isn’t caught at probe (~10.2 s).
+A manual rebind (echo serial0-0 > /sys/bus/serial/drivers/btnxpuart/{unbind,bind}) catches it: ChipID: 7601, Request Firmware: nxp/uartspi_n61x_v1.bin.se.
+Before the clock fix this ended in FW Download Timeout. offset: 0. The bootloader then stayed at ~3 Mbaud (about 340 ns bits; the 10-byte A7 firmware-request packets were confirmed by simulation) until a power-cycle, which explains the later Frame reassembly failed (-84) errors.
+Latest state (2026-10-08, after the clock-fix dtb and a power-cycle): the rebind showed ChipID and the firmware request, and hciconfig showed DOWN INIT RUNNING. The result after waiting 60 s isn’t known yet.
+Next checks:
+dmesg | grep 30860000 should show base_baud = 5000000.
+Did the download finish (real BD address), or time out (offset 0, or a nonzero offset)?
+Possible remaining risk: receiving at 3 Mbaud without SDMA. The boot log shows imx-uart 30860000.serial: We cannot prepare for the RX slave dma!.
+Then make it work at boot without a manual rebind.
+Current imx8mp-cmp9611-wifi.dtsi contents: usdhc2 WiFi (unchanged); &uart1 with DTE pinctrl group uart1-bt-dtegrp, fsl,dte-mode, no rtscts, the 80M clock, and a bluetooth { compatible = "nxp,88w8987-bt"; } node; the &gpio4 bt-reset-release hog; the &gpio5 bt-uart-cts-low-hog.
+Note: “UART3_TXD/RXD” in the pad macros are pad names only. Only the UART1 controller is used.
+Other open items
+WiFi power save: CMD_RESP: 0x107 block in pre_asleep! appeared once (a power-save message). It didn’t recur after a cold boot.
+Camera: unplugged, so the AR0521 -6 errors are expected. Remaining camera goals: output to file, then VNC live view.
+Not yet done: check the poweroff duration fits the 10 s window; optionally clear ALERT by reading 0x0B; set a BATLOW threshold for the 2-cell pack.
+LTC4412 (side discussion): SENSE must connect to the P-FET source (Si7135DP pins 1–3) and must not float or be grounded. CTL high turns the FET off, but the body diode still conducts. For true blocking, use back-to-back FETs.

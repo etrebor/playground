@@ -1,0 +1,61 @@
+# QSXP-ML81 carrier bring-up — handoff summary for an AI assistant
+
+Date: 2026-10-09. Engineer: Bob (embedded developer). Paste this into a new session as context.
+
+## Terminology and conventions (follow these)
+- **som** = Ka-Ro QSXP-ML81 (NXP i.MX8M Plus, 2 GB LPDDR4, 8 GB eMMC).
+- **module** = CEL CMP9611 WiFi/BT module (NXP IW611, reports as SDIW612).
+- **i.MX** = the i.MX8M Plus chip itself.
+- Whenever an i.MX pin is mentioned, give the som pin next to it as `(som:pNN)`, or `(NC)` if not on a som pin. Module pins are written `module:NN`.
+- Schematic pin numbers on the carrier are som pins.
+
+## Build and flash environment
+- Host: Ubuntu 24.04 in VirtualBox on Windows 11. Python/Yocto work is done in a cloned VM (`SafeKaro-ubuntu24-04-PY`); the original VM is the known-good build.
+- Yocto: Ka-Ro BSP, scarthgap. MACHINE `qsxp-ml81`, DISTRO `karo-minimal`, kernel `linux-karo` 6.6.52 (bbappends must be `linux-karo_%.bbappend`), U-Boot `u-boot-karo` 2025.07. Build dir `~/karo-nxp-bsp/build-qsxp-ml81`.
+- linux-karo uses `kernel.bbclass`, so `.cfg` fragments are NOT auto-merged: bbappends `cat` them into `${B}/.config` in `do_configure:append`, and stage `.dtsi` files into `${S}/arch/arm64/boot/dts/freescale/` plus append an `#include` to `imx8mp-qsxp-ml81.dts` (grep-guarded).
+- Custom layers: `meta-cmp9611-wifi` (WiFi/BT dtsi `imx8mp-cmp9611-wifi.dtsi`, `cmp9611-wifi.cfg`, `cmp9611-bt.cfg`, nxp-wlan-sdk Android-config fix, `cmp9611-wifi-init` recipe), `meta-phytec-vm117` (camera, ar0521 patches, fstab, `imx8mp-bmi330-spi.dtsi` + `bmi330-spi.cfg`).
+- Kernel `=m` modules only reach the board via a **rootfs** rebuild; DTB/kernel via **bootfs**. Rebuild and reflash both: `bitbake karo-image-bootfs karo-image-minimal`, then `cp -L` the `.ext4` files from `tmp/deploy/images/qsxp-ml81` to `~/uuu-flash/` (stale files there have caused false regressions before).
+- Flash over USB: boot jumper + `~/uuu-flash/uuu.auto.full`, or jumperless `fastboot usb 0` at the U-Boot prompt + `uuu.auto.fb`. Each flash resets the rootfs filesystem to image size inside the 3 GB partition (grow with `mount -o remount,rw /; resize2fs /dev/mmcblk0p2; mount -o remount,ro /`). Flashing userfs wipes `/mnt/userfs`.
+- eMMC layout: boot 64 MB, rootfs 3 GB (mounted read-only), userfs ~3.9 GB at `/mnt/userfs` (persistent). Bob restores `pythonTools.tar` and `wpa_supplicant.conf` there via `scp -O` after full flashes (dropbear has no SFTP).
+- Power is via USB OTG; an ATtiny1616 controls board power (PA4). A software `reboot` does NOT power-cycle the CMP9611 — firmware changes need a true power-off.
+- No wired Ethernet: WiFi is the only network. Serial console = `ttymxc0` (UART2); `SERIAL_CONSOLES` limited to ttymxc0.
+
+## Status by subsystem
+
+### WiFi (CMP9611 over SDIO, uSDHC2) — WORKING
+- `mlan`/`moal` driver, firmware `nxp/sd_w61x_v1.bin.se` (also `sduart_nw61x_v1.bin.se` combo and `uartspi_n61x_v1.bin.se` BT-only are in `/lib/firmware/nxp/`). Interface `mlan0`, wpa_supplicant + dhcpcd, auto-start via `/etc/init.d/cmp9611-wifi` (recipe `cmp9611-wifi-init`). SSH via dropbear works.
+- PDn# on GPIO1_IO00, WiFi reset GPIO4_IO21.
+
+### Bluetooth (CMP9611 over UART1) — IN PROGRESS, not working yet
+- Kernel: `CONFIG_BT`, `BT_LE`, `SERIAL_DEV_BUS`, `SERIAL_DEV_CTRL_TTYPORT`, `BT_NXPUART=m` (Ka-Ro defconfig had them off). Userspace: `bluez5`, `DISTRO_FEATURES += bluetooth`.
+- Wiring (UART1, Ka-Ro "UART_C"): UART1_RXD/GPIO5_IO22 (som:p93) → module:38; UART1_TXD/GPIO5_IO23 (som:p94) → module:39; UART3_TXD pad/GPIO5_IO27 (som:p95) → module:36 (CTS); UART3_RXD pad/GPIO5_IO26 (som:p96) → module:37 (RTS). UART1 = `ttymxc2` / 0x30860000; serdev takes it over when the BT node is present.
+- Control pins: BT reset GPIO4_IO22 (som:p19) → module:31, active-low with 4.7 k pull-up — U-Boot leaves it driven LOW (held BT in reset); now released by a GPIO hog. BT_HOST_WAKE GPIO1_IO24 (som:p25) → module:41. BT_DEVICE_WAKE GPIO1_IO25 (som:p24) → module:40. These are ENET pads; the carrier has no Ethernet. Module VIO (module:18) 3.29 V; Host_Config[0] (module:19) open.
+- Findings so far: with default DCE mode the RTS/CTS pair was crossed and TX showed contention (som:p94 low ~1.1 V). Switched UART1 to **DTE mode** (`fsl,dte-mode`) — contention gone, clean 0/3.3 V levels, bytes now received.
+- Current dtsi state: DTE TX/RX, `uart-has-rtscts` dropped, GPIO hog holds GPIO5_IO27 (som:p95) low (module CTS asserted), hog releases BT reset GPIO4_IO22 (som:p19).
+- Current symptom: at boot `btnxpuart` says "FW already running" then HCI timeouts (-110) — it probes before the hog/firmware order is settled. After rebind it detects the bootloader (ChipID 7601), requests `nxp/uartspi_n61x_v1.bin.se`, then **"FW Download Timeout. offset: 0"** (bootloader never requests a chunk).
+- Ideas for next steps: (1) suspect the download-phase baud/handshake — check whether the bootloader expects flow control during download (som:p96 RTS now unused), scope som:p93/p94 during the download attempt; (2) retest the **combo** route now that DTE fixed the UART: cold power-off, WiFi loads `sduart_nw61x_v1.bin.se` (verify "FW download over", not "Skip FW download"), then `rmmod btnxpuart; modprobe btnxpuart`; (3) control probe order (btnxpuart after moal and reset release); (4) long term: make Linux reset the WiFi chip at boot so warm reboots can't leave stale firmware; rework carrier so the handshake pair matches.
+- Useful diagnostics: `/proc/tty/driver/IMX-uart` tx/rx counters; `devmem 0x30860084` (UCR2) / `0x30860094` (USR1) / `0x308600B4` (UTS) only while the port is open.
+
+### Camera (PHYTEC) — paused
+- Using VM-017 board (sensor at i2c 0x18, EEPROM 0x57) on I2C2 = Linux bus 1, mainline `ar0521.c` with a patched post-reset delay (msleep 100) that fixed the I2C write error. NXP staging ISI/CSI drivers in use; `/dev/video0` registers. Camera currently not attached. Goals still open: confirm no errors, capture to file, VNC live view, decide whether the patch can be removed.
+
+### Liquid lens (MAX14574EWL + Corning Varioptic) — driver verified, lens pending
+- MAX14574 on bus 1 at 0x77, EN pulled high. C30 (VH) replaced with 100 V part; L2 is XFL2010-332MEC (current OK at IL 0–1; ~68 V across it exceeds Coilcraft's 40 V listing — ask Coilcraft). D1 part number not yet checked.
+- Bench results: internal/external (RT1 NTC) temps agree ~38 °C; Vpeak 72.4 V; 4.95 kHz; COM–LL1 lag 12.2 / 45.2 / 98.8 µs at codes 0 / 512 / 1023 — matches datasheet; unit gain ~+2.7 %.
+- Only LL1 and COM are routed to the lens connector (R34 0 Ω, R33 5.1 kΩ on COM — confirm intent). Lens: **C-S-25H0-160-43I** (6-pin 0.5 mm FPC-A-43, matches J7). Waiting on Corning TEDS for FPC pinout and max Vrms → set `CODE_MAX` (≈900 until known).
+
+### Other carrier hardware
+- BMI330 IMU: ECSPI1 → `/dev/spidev1.0`, chip ID 0x48 confirmed; pins GPIO5_IO06–IO09 (som:p100/p99/p98/p97).
+- BMM350 magnetometer: Linux bus 2 (I2C_B) addr 0x14, chip ID 0x33, OTP OK; INT GPIO1_IO27 (ENET_RD1 pad).
+- PMIC PCA9450C on bus 0 (0x25) — read-only.
+- USB host (som:p43–45) verified with a flash drive; OTG (som:p46–48) proven by flashing; OTG VBUS sensed via 5.1 k/10 k divider.
+- RGB status LED GPIO4_IO24/IO23/IO25 (red/green/blue), now via `/sys/class/leds`.
+- ATtiny1616 on UART_B (`ttymxc1`) monitors a BQ35100 gauge (2-cell pack, calibrated).
+
+## Test tools on the board (`/mnt/userfs/pythonTools`, each with a `.txt` README, index in `README.txt`)
+`hwtest.py` (I2C/GPIO/SPI, spi-probe), `bmi330.py`, `bmm350.py`, `liquidlens.py` (info/temp/check/set/step/sweep/off; safety limits), `rgbled.py`, `wifisleep.py` (ps/down/off with SSH-safe timed resume), `usb_integrity.sh`.
+
+## Other pending items
+- Remove the `#include "imx8mp-cmp9611-wifi.dtsi"` that sits in Ka-Ro's vendor copy of `imx8mp-qsxp-ml81.dts`; let the bbappend add it.
+- Consider `IMAGE_ROOTFS_SIZE` / `IMAGE_ROOTFS_MAXSIZE` so flashing doesn't shrink rootfs.
+- Add `iw` to the image for WiFi power-save control.

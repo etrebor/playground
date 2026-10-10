@@ -1,0 +1,83 @@
+Here’s a condensed prompt you can paste into a new chat:
+
+Context: Custom board bring-up — QSXP-ML81 (NXP i.MX8M Plus) with CMP9611 WiFi
+
+Hardware:
+
+SOM: Ka-Ro QSXP-ML81 (i.MX8M Plus, 2GB LPDDR4, 8GB eMMC)
+WiFi module: CEL CMP9611 (NXP IW611 chipset, identifies internally as SDIW612)
+Interface: SDIO on uSDHC2 (GPIO2_IO13-18), WiFi reset GPIO4_IO21 (SAI2_RXFS), PDn# GPIO1_IO00
+Power: USB OTG only (no separate VIN), 3.3V to module pins 49/50
+Boot: jumper on module pin 52 (BOOT_MODE0), low=eMMC, high=USB SDP
+eMMC: uSDHC3 (internal to module, not on carrier pins)
+Build host: Ubuntu 24.04 desktop in VirtualBox on Windows 11
+
+Yocto build: Ka-Ro BSP scarthgap branch
+
+Machine: qsxp-ml81, Distro: karo-minimal
+Kernel: linux-karo 6.6.52 (NOT linux-imx — important for .bbappend naming)
+U-Boot: u-boot-karo 2025.07
+
+Key fixes required (all confirmed working):
+
+Ka-Ro layer.conf — removes nxpiw612-sdio from MACHINE_FEATURES by default; delete that line from meta-karo-nxp/conf/layer.conf’s MACHINE_FEATURES:remove block
+local.conf additions:
+MACHINE_FEATURES:append = " nxpiw612-sdio nxpwifi-all-sdio"
+DISTRO_FEATURES:append = " wifi"
+UBOOT_CONFIG = "default noenv mfg"
+IMAGE_INSTALL:append = " dropbear"
+U-Boot variant — karo-minimal distro only builds noenv and mfg variants by default; must add default to UBOOT_CONFIG — the noenv variant ignores saveenv entirely, causing cold boot failure. Flash u-boot-qsxp-ml81-default.bin to mmc0boot0
+Kernel recipe name — Ka-Ro uses linux-karo, not linux-imx; .bbappend must be named linux-karo_%.bbappend
+Kernel config fragment — linux-karo uses kernel.bbclass + cml1.bbclass (not kernel-yocto.bbclass), so .cfg files in SRC_URI are NOT auto-merged. Must use do_configure:append() to cat the fragment manually
+NXP driver Android defaults — nxp-wlan-sdk Makefile defaults to CONFIG_ANDROID_KERNEL=y which disables cfg80211; fix via .bbappend:
+EXTRA_OEMAKE += "CONFIG_ANDROID_KERNEL=n CONFIG_STA_CFG80211=y CONFIG_UAP_CFG80211=y"
+
+Both nxp-wlan-sdk_%.bbappend AND kernel-module-nxp-wlan_%.bbappend need this
+
+CONFIG_CFG80211 — not enabled in Ka-Ro’s default kernel config; causes “struct has no member ‘wdev’” errors without the fragment fix above
+Devicetree — imx8mp-cmp9611-wifi.dtsi added via #include in imx8mp-qsxp-ml81.dts; staged via do_configure:append + install into ${S}/arch/arm64/boot/dts/freescale/ since Ka-Ro’s overlay staging mechanism doesn’t auto-copy non-registered files
+U-Boot environment — bootcmd_mmc in default compiled environment missing loadfdt; fix once at first boot:
+setenv bootcmd_mmc run loadfdt loadkernel bootargs_mmc
+setenv append_bootargs root=/dev/mmcblk0p2 rw
+saveenv
+
+WiFi driver details (confirmed working):
+
+Driver: mlan.ko + moal.ko (load order matters — mlan first)
+Firmware: nxp/sd_w61x_v1.bin.se (family codename w61x/n61x, NOT iw611)
+Load command: modprobe moal fw_name=nxp/sd_w61x_v1.bin.se
+Interface: mlan0 appears after successful load
+SDIO detection confirmed: mmc1: new high speed SDIO card at address 0001
+Driver version string: SDIW612---18.99.3.p21.10 (confirms IW611=SDIW612 internally)
+
+UUU flash (uuu.auto):
+
+MFG U-Boot: u-boot-qsxp-ml81-mfg.bin (SDPS boot)
+Production U-Boot: u-boot-qsxp-ml81-default.bin → mmc0boot0
+Boot partition: karo-image-bootfs-qsxp-ml81.ext4
+Rootfs: karo-image-minimal-qsxp-ml81.ext4
+Userfs: karo-image-userfs-qsxp-ml81.ext4
+emmc_dev=0 (uSDHC3, confirmed from qsxp-ml81.env)
+GPT layout: boot(64MB), rootfs(128MB), userfs(MAX)
+
+Custom Yocto layer: meta-cmp9611-wifi
+Files:
+
+conf/layer.conf — priority 15, scarthgap compatible
+recipes-kernel/linux/linux-karo_%.bbappend — stages dtsi + CFG80211 cfg fix
+recipes-kernel/linux/linux-imx/imx8mp-cmp9611-wifi.dtsi — confirmed pin assignments
+recipes-kernel/linux/linux-imx/cmp9611-wifi.cfg — CONFIG_CFG80211=y etc.
+recipes-kernel/nxp-wlan-sdk/nxp-wlan-sdk_%.bbappend — Android config fix
+recipes-kernel/nxp-wlan-sdk/kernel-module-nxp-wlan_%.bbappend — same fix
+recipes-core/images/cmp9611-bringup-initramfs.bb — WiFi bring-up initramfs
+
+Current status: Full cold boot from eMMC working, WiFi confirmed connected to AP with DHCP lease, dropbear SSH server available after modprobe of WiFi modules.
+
+Outstanding items:
+
+WiFi/SSH not yet auto-starting on boot (modules need modprobe manually each boot)
+Bluetooth deferred (IW611 BT is UART-based, separate from SDIO WiFi path)
+PDn#/wifi_reset sequencing order vs CMP9611 datasheet not formally verified (works in practice)
+
+That covers all the confirmed data points, decisions, and fixes from this session — should give a new chat full context without needing to re-derive any of it.
+

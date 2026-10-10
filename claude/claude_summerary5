@@ -1,0 +1,187 @@
+Project: Ka-Ro QSXP-ML81 (i.MX8M Plus) bring-up: WiFi, then PHYTEC camera
+Role
+
+Help an embedded Linux engineer (Bob) with Yocto bring-up on a custom carrier board. Give exact commands and file contents. Verify Kconfig symbols, recipe names and paths against the real source rather than guessing. Flag unknowns clearly. Ask for bitbake -e or grep output when a path or variable is uncertain.
+
+Environment
+SOM: Ka-Ro QSXP-ML81 (i.MX8M Plus, 2GB LPDDR4, 8GB eMMC on uSDHC3)
+Build host: Ubuntu 24.04 in VirtualBox on Windows 11
+BSP: Ka-Ro scarthgap at /home/bob/karo-nxp-bsp/, build dir build-qsxp-ml81
+Machine and distro: qsxp-ml81, karo-minimal
+Kernel: linux-karo 6.6.52. Use linux-karo_%.bbappend, never linux-imx.
+U-Boot: u-boot-karo 2025.07
+Power and boot: USB OTG only, 3.3V to module pins 49/50. Pin 52 (BOOT_MODE0) low = eMMC, high = USB SDP.
+Layers: meta-karo-nxp, meta-karo-distro, meta-imx-bsp, poky, meta-openembedded. Custom layers are meta-cmp9611-wifi (priority 15) and meta-phytec-vm117 (priority 16, in sources/).
+Phase 1: WiFi (done, cold boot from eMMC working)
+
+Hardware: CEL CMP9611 (NXP IW611, reports internally as SDIW612) on uSDHC2 (GPIO2_IO13-18). WiFi reset is GPIO4_IO21 and PDn# is GPIO1_IO00.
+
+Confirmed fixes:
+
+Delete the nxpiw612-sdio line from the MACHINE_FEATURES:remove block in meta-karo-nxp/conf/layer.conf.
+local.conf:
+   MACHINE_FEATURES:append = " nxpiw612-sdio nxpwifi-all-sdio"
+   DISTRO_FEATURES:append = " wifi"
+   UBOOT_CONFIG = "default noenv mfg"
+   IMAGE_INSTALL:append = " dropbear"
+U-Boot: karo-minimal builds only noenv and mfg by default. The noenv variant ignores saveenv, which causes cold-boot failure. Flash u-boot-qsxp-ml81-default.bin to mmc0boot0.
+Kernel config fragment: linux-karo uses kernel.bbclass and cml1.bbclass, not kernel-yocto. .cfg files in SRC_URI are not auto-merged, so cat them in do_configure:append(). CONFIG_CFG80211 is off by default. Without it you get “struct has no member ‘wdev’” errors.
+NXP driver defaults: the nxp-wlan-sdk Makefile defaults to CONFIG_ANDROID_KERNEL=y, which disables cfg80211. Add this to both nxp-wlan-sdk_%.bbappend and kernel-module-nxp-wlan_%.bbappend:
+   EXTRA_OEMAKE += "CONFIG_ANDROID_KERNEL=n CONFIG_STA_CFG80211=y CONFIG_UAP_CFG80211=y"
+Devicetree: imx8mp-cmp9611-wifi.dtsi is #included from imx8mp-qsxp-ml81.dts. Ka-Ro’s overlay staging doesn’t copy unregistered files, so install the dtsi into ${S}/arch/arm64/boot/dts/freescale/ via do_configure:append.
+U-Boot env, once at first boot:
+   setenv bootcmd_mmc run loadfdt loadkernel bootargs_mmc
+   setenv append_bootargs root=/dev/mmcblk0p2 rw
+   saveenv
+
+Runtime:
+
+Load with modprobe mlan, then modprobe moal fw_name=nxp/sd_w61x_v1.bin.se. The firmware family is w61x, not iw611. mlan0 appears afterwards.
+Success looks like mmc1: new high speed SDIO card at address 0001 and driver string SDIW612---18.99.3.p21.10.
+WiFi joined an AP with a DHCP lease, and dropbear works after modprobe.
+
+UUU flash (uuu.auto):
+
+MFG U-Boot u-boot-qsxp-ml81-mfg.bin (SDPS boot).
+Production U-Boot u-boot-qsxp-ml81-default.bin goes to mmc0boot0.
+Images: bootfs, rootfs and userfs .ext4 (karo-image-*-qsxp-ml81.ext4), with emmc_dev=0.
+GPT layout: boot 64MB, rootfs 128MB, userfs MAX.
+
+Gotcha: the WiFi dtsi and cfg live in recipes-kernel/linux/linux-imx/ inside the layer, but the bbappend is linux-karo_%. Make sure FILESEXTRAPATHS:prepend points at the directory that actually holds the files.
+
+Open items:
+
+Modules need a manual modprobe each boot. Add module autoload (e.g. KERNEL_MODULE_AUTOLOAD plus modprobe.d options for fw_name) and a systemd or init unit for WiFi and dropbear.
+Bluetooth is deferred (IW611 BT is UART, separate from the SDIO path).
+PDn#/reset sequencing hasn’t been checked against the CMP9611 datasheet. It works in practice.
+Phase 2: PHYTEC camera (in progress)
+
+Hardware
+
+Board etched S001986C0, 1513.1 PHYTEC
+Identified as a VM-117 phyCAM-M-mini module (ON Semi AR0521 sensor)
+Cable marked AXON AWM 2896 80C VW-1
+Target is 4-lane MIPI CSI-2
+
+Pinout (from the phyCAM-M connector):
+
+I2C on i2c2 (GPIO5_IO16-17). Default address 0x36, with GPIO1_IO29 as the address strap (low).
+Reset on GPIO1_IO28.
+CSI_*_A maps to &mipi_csi_0.
+VCAM pin 5 is open (3.3V).
+The module has its own 27MHz oscillator, so the SoC supplies no MCLK.
+
+Decisions made
+
+Use the mainline ar0521.c already in linux-karo 6.6.52 for the proof of concept, on the ISI raw Bayer path.
+Defer PHYTEC’s vvcam/ISP-based phycam-ar0521.c port to a later goal.
+The driver’s devm_clk_get(dev, "extclk") is mandatory and feeds its PLL math. Satisfy it with a fixed-clock node at the real oscillator frequency, even though the SoC doesn’t drive the pin.
+Kconfig symbols (verified in source): CONFIG_VIDEO_AR0521, CONFIG_VIDEO_IMX8MQ_MIPI_CSI2, CONFIG_VIDEO_IMX8_ISI.
+Still to tune: csis-hs-settle (placeholder 17). Adjust once frames appear, since garbage frames are the usual symptom of a wrong value.
+
+Layer meta-phytec-vm117
+
+conf/layer.conf (priority 16)
+recipes-kernel/linux/linux-karo_%.bbappend
+linux-karo/ar0521-enable.cfg
+linux-karo/imx8mp-qsxp-ml81-vm117.dtsi
+
+local.conf additions:
+
+MACHINE_FEATURES:append = " vm117-camera"
+IMAGE_INSTALL:append = " v4l-utils gstreamer1.0 gstreamer1.0-plugins-good"
+
+Lessons from the build failures
+
+A bare labeled node like a fixed-clock is invalid at .dtsi top level. Wrap it in / { };.
+The bbappend needs both FILESEXTRAPATHS:prepend and SRC_URI +=. Confirm with bitbake -e linux-karo | grep ^SRC_URI=.
+bitbake -c cleansstate linux-karo isn’t enough. Also rm -rf tmp/work-shared/qsxp-ml81/kernel-source/.
+The dtsi had a missing < on the fsl,pins = < line in the pinctrl block. Find these with sed -n '60,70p' <file> | cat -A. Adding #include "imx8mp-pinfunc.h" was also done and is harmless.
+Find the kernel source path with bitbake -e linux-karo | grep ^S=. It’s usually under tmp/work-shared/qsxp-ml81/kernel-source/, and edits there don’t persist across rebuilds.
+Goals, in order
+Drivers and control software via Yocto. Layer scaffolded. Get a clean bitbake of the kernel and image.
+Confirm no errors. On boot, check dmesg | grep -i "ar0521\|csi\|isi", v4l2-ctl --list-devices and media-ctl -p. Confirm the sensor probes at 0x36 on i2c2 and the media graph links sensor → CSI → ISI → /dev/videoX.
+Camera output to file. Not yet done. Start with raw Bayer via v4l2-ctl --stream-mmap --stream-count=1 --stream-to=frame.raw, then a GStreamer pipeline with debayering to JPEG or MP4.
+Live view over VNC. Not yet done. The image is headless, so it needs a display path (for example Weston’s VNC backend, or Xvfb with x11vnc) with a GStreamer sink into it. Decide this once step 3 works.
+Later: port PHYTEC’s vvcam/ISP driver for full image quality.
+Working style
+Give exact file paths and complete file contents.
+Have Bob run grep or bitbake -e to confirm rather than assuming.
+Fix one failure at a time.
+Keep each layer’s files as the source of truth, not hand edits in the kernel work tree.
+
+If you paste this into the new project, tell me the last build or boot result from the VM-117 layer. Then I can update the “in progress” section to match.
+
+ignore last
+
+Got it, ignoring that. Still waiting on one of these before I can narrow it down further:
+
+bash
+dmesg | grep -B5 -A15 "probe of mmc1:0001:1 failed"
+bash
+ls -la /lib/firmware/nxp/sd_w61x_v1.bin.se
+bash
+dmesg | grep -i "firmware\|w61x\|moal\|mlan"
+
+Whichever you run first is fine — paste back the actual output and I’ll pick up from there.
+
+ls -la /lib/firmware/nxp/sd_w61x_v1.bin.se
+
+-rw-r--r--    1 root     root        665336 Sep 13  2026 /lib/firmware/nxp/sd_w61x_v1.bin.se
+
+root@qsxp-ml81:~# dmesg | grep -i "firmware\|w61x\|moal\|mlan"
+
+[  121.620304] Firmware Init Failed
+
+Diagnosing a firmware initialization failure on a module.
+
+Firmware file is present and a reasonable size, so it’s not a missing-file problem — the driver got far enough to request and load it, then the module itself reported “Firmware Init Failed”. That’s the SDIW612/IW611 firmware failing to complete its own init handshake with the driver, not a driver-side error. This is a strong signal pointing at hardware sequencing rather than software — exactly the PDn#/reset ordering that was flagged as unverified against the datasheet, now potentially showing up as a real problem on a second board where timing might differ slightly.
+
+Get the full surrounding context and check reset/PDn# state:
+
+bash
+dmesg | grep -B10 -A5 "Firmware Init Failed"
+bash
+cat /sys/kernel/debug/gpio 2>/dev/null
+
+(unfiltered this time — paste the whole thing, or at least anything mentioning gpio1 or gpio4, so I can see PDn# / GPIO1_IO00 and reset / GPIO4_IO21 actual line states)
+
+Also worth trying a clean power-cycle of the module rather than just module reload, since firmware init failures are often sensitive to reset pulse width/timing that a modprobe -r/modprobe cycle won’t redo if the GPIO itself isn’t toggled as part of unload:
+
+bash
+modprobe -r moal mlan
+sleep 2
+modprobe mlan
+sleep 1
+modprobe moal fw_name=nxp/sd_w61x_v1.bin.se
+dmesg | tail -30
+
+If it fails identically again, the next thing to check is whether this new board’s PDn#/reset lines are actually connected the same way as the working one — worst case, a strapping or assembly difference on this unit. Paste back the -B10 -A5 context and the GPIO dump first.
+
+installed latest build, power down, shut off power souce, power up, ready to test last patch
+
+Confirming which patch needs testing after the restart.
+
+Good — a full power cycle (not just modprobe -r/reboot) is the right move here anyway, since the failed-probe path leaves the sensor held in reset and a reboot alone wouldn’t necessarily clear that state cleanly.
+
+Run the test and capture the extended debug patch’s output:
+
+bash
+dmesg -C                     # clear the ring buffer so we only see this attempt
+modprobe ar0521
+dmesg | grep -iE "ar0521|i2c|errno|addr|flags"
+
+What we’re specifically looking for, from the extended patch: the logged msg.addr, msg.flags, and msg.len on the failing i2c_transfer() call, compared against what the manual i2ctransfer command used when it succeeded. The hypothesis is a flags mismatch — most likely I2C_M_TEN (10-bit addressing) being set when it shouldn’t be, or an unexpected flag in the driver’s call that the manual tool doesn’t set.
+
+If you still have the manual command that worked, run it again right after for a clean side-by-side on this same boot:
+
+bash
+i2ctransfer -y 1 w2@0x18 0x01 0x12   # or whatever the actual working initial_regs[] write was
+
+Paste back:
+
+The dmesg output from the modprobe attempt (specifically the new debug lines)
+Confirmation of which address this build is probing at (0x18 per the last devicetree change, unless that was reverted)
+Whether the manual i2ctransfer still succeeds on this exact boot
+
+That’ll tell us whether the flags hypothesis holds or whether we need to look elsewhere — like timing between power_on()’s reset deassert and the very first i2c_transfer() call, which the driver does automatically but which your manual tests necessarily insert a human-scale delay before.

@@ -1,0 +1,83 @@
+wifisleep.py - WiFi sleep / resume (CMP9611, mlan0)
+===================================================
+
+Puts the CMP9611 WiFi into one of three low-power states and brings it
+back, reporting how long reconnection takes. All output to the console
+(or /tmp/wifisleep.log when detached, see SSH below).
+
+Install:  scp -O wifisleep.py root@<board-ip>:/mnt/userfs/
+Needs:    python3, root. 'ps' mode also needs iw (IMAGE_INSTALL += "iw").
+
+
+MODES
+-----
+  ps     802.11 power save. The chip dozes between AP beacons; the link,
+         IP address and SSH stay up. Lowest impact, modest saving.
+         (iw dev mlan0 set power_save on|off)
+
+  down   Interface down: radio off, AP disconnected. wpa_supplicant keeps
+         running and reassociates when the interface comes back up;
+         dhcpcd renews the address.
+
+  off    Deepest: runs /etc/init.d/cmp9611-wifi stop, stops
+         wpa_supplicant and dhcpcd, brings mlan0 down and unloads the
+         moal/mlan modules. Resume runs the init script start, which
+         reloads the firmware and reconnects (several seconds).
+
+
+USAGE
+-----
+  python3 wifisleep.py status
+  python3 wifisleep.py sleep ps | down | off [--for S] [--timeout S] [--force]
+  python3 wifisleep.py resume ps | down | off [--timeout S]
+
+  --for S      resume automatically after S seconds, then report the
+               reconnect time
+  --timeout S  how long resume waits for link + IPv4 (default 60)
+  --force      allow down/off over SSH without --for
+
+Examples:
+  python3 wifisleep.py sleep ps                  stays connected
+  python3 wifisleep.py resume ps
+  python3 wifisleep.py sleep down --for 30       timed test
+  python3 wifisleep.py sleep off --for 120       deepest, timed
+
+status shows: mlan0 state, IPv4, SSID, power-save state, loaded modules,
+wpa_supplicant / dhcpcd processes.
+
+
+SSH - IMPORTANT
+---------------
+WiFi is the board's only network. 'down' and 'off' cut the SSH session.
+
+  - Over SSH without --for: refused (unless --force).
+  - Over SSH with --for: the script detaches from the session, sleeps,
+    resumes on its own and writes progress to /tmp/wifisleep.log.
+    Reconnect after the delay plus a few seconds and check:
+      cat /tmp/wifisleep.log
+  - From the serial console (ttymxc0): everything works directly,
+    including untimed sleep/resume.
+  'ps' never disconnects and is always safe over SSH.
+
+
+MEASURING THE SAVING
+--------------------
+Measure board supply current (bench supply or inline meter) in each
+state: normal, sleep ps, sleep down, sleep off. 'off' only unloads the
+driver; how far the chip powers down depends on the PDn#/reset handling
+in the devicetree. The PDn# line (GPIO1_IO00) is shared with Bluetooth.
+
+
+TROUBLESHOOTING
+---------------
+  resume reports NOT reconnected   check dmesg, wpa_supplicant running,
+                                   credentials file on /mnt/userfs
+  'off' resume fails               init script missing or its start
+                                   action not handling a reload -
+                                   run it by hand and read the output
+  power save 'unknown'             iw not installed
+
+
+SEE ALSO
+--------
+README.txt - index of all test tools

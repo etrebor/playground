@@ -32,6 +32,9 @@ TOOLS
   rgbled.py        RGB status LED (GPIO4 IO24/23/25): off, on, set, test.
                    README: rgbled.txt
 
+  wifisleep.py     WiFi sleep/resume: power save, link down, driver off;
+                   SSH-safe timed resume. README: wifisleep.txt
+
   usb_integrity.sh USB host port loopback test into the OTG port
                    (mass-storage gadget), checksum compare.
                    README: usb_integrity.txt

@@ -1,0 +1,8 @@
+I have attached three images for power, com port (console), and attiny1616 programming.
+
+Com uses a 4-pin connector that attaches to the board with red wire to pin 1(closest to USB ports). In line is a circuit board with a diode that is pulled up via resistor to development board power(red wire). The diode prevents back feed on the development boards rx pin when powered down. Without this isolation, the com often keeps the main chip running even with all other power removed.
+
+The programmer 3 pin connector attaches to the board with ground wire black towards usb (labeled TOWARD USB). On the Atmel Ice AVR connector, the cable is attached with the writing AVR facing up. Note, the 10-pin connector tab is cut off. This allows the connector to be inserted upside down, meaning the cut off tab goes opposite the receptors tab notch.
+
+The power wires are black for ground; blue for battery input when using power supply or output test point when using batteries; red for 5V input when not using the usb c cable or for monitoring the 5 v when using usb c cable.
+
